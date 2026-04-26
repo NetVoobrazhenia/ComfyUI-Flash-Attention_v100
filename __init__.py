@@ -262,40 +262,48 @@ class FlashAttnV100Patcher:
                 
                 # Determine input layout: ComfyUI uses either 3D or 4D tensors
                 if q.dim() == 3:
-                    # Layout A: (batch, seq_len, inner_dim) where inner_dim = heads * head_dim
-                    batch_size, seq_len, inner_dim = q.shape
+                    b_q, s_q, d_q = q.shape
+                    b_k, s_k, d_k = k.shape
+                    b_v, s_v, d_v = v.shape
                     
-                    if inner_dim % heads != 0:
-                        raise ValueError(
-                            f"Cannot determine layout: inner_dim={inner_dim} not divisible by heads={heads}"
-                        )
+                    if not (b_q == b_k == b_v):
+                        raise ValueError(f"Batch size mismatch: q={b_q}, k={b_k}, v={b_v}")
+                    batch_size = b_q
                     
-                    head_dim = inner_dim // heads
-                    expected_numel = batch_size * seq_len * heads * head_dim
+                    if not (d_q == d_k == d_v):
+                        raise ValueError(f"Inner dim mismatch: q={d_q}, k={d_k}, v={d_v}")
+                    if d_q % heads != 0:
+                        raise ValueError(f"Inner dim {d_q} not divisible by heads={heads}")
                     
-                    if q.numel() != expected_numel:
-                        raise ValueError(
-                            f"Reshape mismatch: tensor has {q.numel()} elements, "
-                            f"but target ({batch_size}, {seq_len}, {heads}, {head_dim}) "
-                            f"requires {expected_numel}. q.shape={q.shape}"
-                        )
+                    head_dim = d_q // heads
                     
-                    # Reshape to Flash Attention 2 layout: (B, M, H, D)
-                    q_fa = q.reshape(batch_size, seq_len, heads, head_dim)
-                    k_fa = k.reshape(batch_size, seq_len, heads, head_dim)
-                    v_fa = v.reshape(batch_size, seq_len, heads, head_dim)
+                    q_fa = q.reshape(batch_size, s_q, heads, head_dim)
+                    k_fa = k.reshape(batch_size, s_k, heads, head_dim)
+                    v_fa = v.reshape(batch_size, s_v, heads, head_dim)
                     is_3d_input = True
                     
                 elif q.dim() == 4:
-                    # Layout B: Already in FA2 format (batch, seq_len, heads, head_dim)
-                    batch_size, seq_len, h_in, d_in = q.shape
-                    if h_in != heads:
-                        raise ValueError(f"4D heads mismatch: {h_in} vs {heads}")
+                    # FA2 layout: (batch, seq_len, heads, head_dim)
+                    b_q, s_q, h_q, d_q = q.shape
+                    b_k, s_k, h_k, d_k = k.shape
+                    b_v, s_v, h_v, d_v = v.shape
+                    
+                    if not (b_q == b_k == b_v):
+                        raise ValueError(f"4D batch mismatch: q={b_q}, k={b_k}, v={b_v}")
+                    batch_size = b_q
+                    
+                    if not (h_q == h_k == h_v == heads):
+                        raise ValueError(f"4D heads mismatch: q={h_q}, k={h_k}, v={h_v}, expected={heads}")
+                    
+                    if not (d_q == d_k == d_v):
+                        raise ValueError(f"4D head_dim mismatch: q={d_q}, k={d_k}, v={d_v}")
+                    head_dim = d_q
+                    
                     q_fa, k_fa, v_fa = q, k, v
-                    head_dim = d_in
                     is_3d_input = False
                 else:
                     raise ValueError(f"Unsupported q.ndim={q.dim()}, expected 3 or 4")
+
 
                 # Volta tensor cores require FP16 input
                 if PatchConfig.FORCE_FP16 and q_fa.dtype != torch.float16:
@@ -332,14 +340,12 @@ class FlashAttnV100Patcher:
                         min=PatchConfig.SANITIZE_MIN,
                         max=PatchConfig.SANITIZE_MAX
                     )
+        
+                if debug:
+                    logger.warning(f"[FlashAttnV100] FA compute q={q.shape}, k={k.shape}, out={out_fa.shape}")
 
-                if debug :
-                    logger.debug(f"[FlashAttnV100] FA compute {q.shape}")
                 # Restore original layout
-                if is_3d_input:
-                    return out_fa.reshape(batch_size, seq_len, inner_dim)
-                else:
-                    return out_fa.reshape(batch_size, seq_len, heads, head_dim)
+                return out_fa.reshape(batch_size, s_q, d_q) if is_3d_input else out_fa
 
             except Exception as e:
                 if debug or PatchConfig.AUTO_FALLBACK:
