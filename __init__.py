@@ -58,50 +58,92 @@ class FlashAttnV100Patcher:
             # Store original
             self.original_attention = attn.optimized_attention
             
-            def v100_attention(q, k, v, heads, mask=None, attn_precision=None):
+            def v100_attention(q, k, v, heads, mask=None, attn_precision=None, 
+                            transformer_options=None):
                 """
                 ComfyUI gives us: (batch*heads, seq_len, head_dim)
                 FlashAttn expects: (batch, seq_len, heads, head_dim)
                 """
+                debug_on = False
                 try:
-                    batch_size = q.shape[0] // heads
-                    seq_len = q.shape[1]
-                    head_dim = q.shape[2]
+                    orig_dtype = q.dtype
+                    q, k, v = q.contiguous(), k.contiguous(), v.contiguous()
                     
-                    # Reshape to (batch, heads, seq_len, head_dim) then transpose
-                    q = q.reshape(batch_size, heads, seq_len, head_dim).transpose(1, 2)
-                    k = k.reshape(batch_size, heads, seq_len, head_dim).transpose(1, 2)
-                    v = v.reshape(batch_size, heads, seq_len, head_dim).transpose(1, 2)
-                    
+                    # Reshape to FA2 format (B, M, H, D)
+                    if q.dim() == 3:
+                        batch_size, seq_len, inner_dim = q.shape
+                        if inner_dim % heads != 0: raise ValueError(f"inner_dim {inner_dim} not divisible by heads {heads}")
+                        head_dim = inner_dim // heads
+                        q_fa = q.reshape(batch_size, seq_len, heads, head_dim)
+                        k_fa = k.reshape(batch_size, seq_len, heads, head_dim)
+                        v_fa = v.reshape(batch_size, seq_len, heads, head_dim)
+                        is_3d_input = True
+                    elif q.dim() == 4:
+                        batch_size, seq_len, h_in, d_in = q.shape
+                        if h_in != heads: raise ValueError(f"4D heads mismatch: {h_in} vs {heads}")
+                        q_fa, k_fa, v_fa = q, k, v
+                        head_dim = d_in
+                        is_3d_input = False
+                    else:
+                        raise ValueError(f"Unsupported q.ndim={q.dim()}")
+
+                    if q_fa.dtype != torch.float16:
+                        q_fa = q_fa.to(torch.float16)
+                        k_fa = k_fa.to(torch.float16)
+                        v_fa = v_fa.to(torch.float16)
+                                
                     # Call Flash Attention 1 (V100 compatible)
                     # causal=False for standard diffusion (non-autoregressive)
-                    out = flash_attn_func(q, k, v, causal=False, softmax_scale=None)
-                    
-                    # Reshape back to (batch*heads, seq_len, head_dim)
-                    out = out.transpose(1, 2).reshape(batch_size * heads, seq_len, head_dim)
-                    return out
-                    
+                    out_fa = flash_attn_func(
+                        q_fa, k_fa, v_fa,
+                        dropout_p=0.0, 
+                        softmax_scale=None, 
+                        causal=False,
+                        window_size=(-1, -1), 
+                        softcap=0.0, 
+                        alibi_slopes=None,
+                        deterministic=False, 
+                        return_attn_probs=False,
+                    )
+
+                    out_fa = out_fa.to(orig_dtype)
+
+                    out_fa = torch.nan_to_num(out_fa, nan=0.0, posinf=0.0, neginf=0.0)
+                    out_fa = torch.clamp(out_fa, min=-1e4, max=1e4)
+                    if debug_on: 
+                        print(f"[FlashAttnV100] FA kernel active on: {q.shape}")
+
+                    return out_fa.reshape(batch_size, seq_len, inner_dim) if is_3d_input else out_fa.reshape(batch_size, seq_len, heads, head_dim)
+
                 except Exception as e:
                     # Fallback to standard optimized attention if flash attn fails
-                    print(f"[FlashAttnV100]FA kernel failed: {e}, falling back")
-                    return self.original_attention(q, k, v, heads, mask)
+                    if debug_on: 
+                        print(f"[FlashAttnV100] FA kernel failed: {e}, falling back")
+                    fallback_kwargs = {
+                        'attn_precision': attn_precision,
+                        'transformer_options': transformer_options
+                    }
+                    if mask is not None:
+                        fallback_kwargs['mask'] = mask
+                    return self.original_attention(q, k, v, heads, **fallback_kwargs)
             
-            # Replace the attention function
             attn.optimized_attention = v100_attention
-            
+
             # Force ComfyUI to use our patched version
             if hasattr(mm, 'force_attention_upcast'):
                 mm.force_attention_upcast = False
             
             self.patched = True
-            print(f"✅ [FlashAttnV100] Active on {self.gpu_arch} (V100/T4 mode)")
+            print(f"[FlashAttnV100] Active on {self.gpu_arch} (V100/T4 mode | FP16 enforced | Robust reshape)")
             return True
             
         except ImportError:
-            print(f"⚠️ [FlashAttnV100] flash_attn_v100 module not installed for V100 please install from https://github.com/ai-bond/flash-attention-v100")
+            print("[FlashAttnV100] flash_attn_v100 module not installed for V100 please install from https://github.com/ai-bond/flash-attention-v100")
             return False
         except Exception as e:
-            print(f"❌ [FlashAttnV100] Patch failed: {e}")
+            print(f"[FlashAttnV100] Patch failed: {e}")
+            import traceback
+            traceback.print_exc()
             return False
     
     def restore(self):
