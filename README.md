@@ -1,106 +1,80 @@
-# ⚡ ComfyUI Flash Attention V100
+# ComfyUI Flash Attention V100
 
-[![GPU](https://img.shields.io/badge/GPU-V100%20%7C%20T4%20%7C%20sm<80-green)](https://github.com/ai-bond/flash-attention-v100)
-[![License](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+## Overview
+A custom node for ComfyUI that patches the native attention mechanism to utilize Flash Attention optimized for NVIDIA Volta (V100) and Turing architecture GPUs. This extension enables accelerated inference for diffusion, video generation, and text-to-speech models on GPU architectures that lack native Flash Attention 2 support. It provides automatic tensor layout detection, numerical stability safeguards, and seamless fallback to PyTorch's native attention when necessary.
 
-A ComfyUI custom node enabling **Flash Attention 1** on legacy NVIDIA GPUs (Tesla V100, T4) that lack Compute Capability 8.0+ required by FlashAttention-2.
+## Features
+- Optimized attention execution for GPUs with compute capability less than 8.0
+- Automatic detection and conversion of 3D and 4D tensor layouts from ComfyUI models
+- Forced FP16 conversion to leverage Volta tensor cores
+- Output sanitization to prevent NaN and Inf propagation in audio/video branches
+- Graceful fallback to standard optimized attention on kernel failure
+- Model type detection and configuration (checkpoint, diffusion, clip, ltxv, flux, qwen)
+- Three dedicated ComfyUI nodes for control, monitoring, and configuration
+- Full API compatibility with Dao-AILab flash-attention and transformers/Qwen3-TTS
 
-> 🔋 **Reduces memory usage by ~30-40%** and **improves generation speed** on compatible GPUs without upgrading hardware.
+## System Requirements
+- NVIDIA GPU with compute capability less than 8.0 (Tesla V100, T4, RTX 20-series, Quadro RTX)
+- CUDA 11.8 or newer
+- Python 3.10 or newer
+- ComfyUI (latest version recommended)
+- [`flash_attn_v100` library](https://github.com/ai-bond/flash-attention-v100) installed in the environment
 
----
+## Installation
+1. Navigate to the ComfyUI `custom_nodes` directory:
+   ```
+   cd ComfyUI/custom_nodes
+   ```
+2. Clone the repository:
+   ```
+   git clone git@github.com:NetVoobrazhenia/ComfyUI_Flash-Attention_v100.git
+   ```
+3. Install the required Volta-compatible Flash Attention library:
+    
+   Refer to the official documentation at https://github.com/ai-bond/flash-attention-v100 for build instructions.
+4. Restart ComfyUI.
 
-## 📋 Overview
+## Usage
+After installation, three nodes will appear in the `attention/flash_v100` category:
 
-Standard FlashAttention-2 requires `sm_80` (Ampere/Ada Lovelace) or newer. This node patches ComfyUI's attention mechanism to use [ai-bond/flash-attention-v100](https://github.com/ai-bond/flash-attention-v100), maintaining compatibility with:
-- **Tesla V100** (sm_70)
-- **Tesla T4** (sm_75)
-- Other Compute Capability 7.x GPUs
+### Flash Attn V100 Controller
+Connect this node between your model loader and sampler/generator nodes.
+- `enable_v100_opt`: Toggle the patch on or off
+- `model_type`: Specify the architecture or leave as auto for automatic detection
+- `model`: Connect the loaded model tensor
+- `debug_mode`: Enable verbose console logging for troubleshooting
 
-### Features
-- 🔍 **Auto-detection**: Only activates on compatible GPUs (< sm_80)
-- 🎛️ **Manual Control**: Toggle on/off via node interface
-- 🛡️ **Safe Fallback**: Automatically reverts to standard attention if kernel errors occur
-- 📊 **Status Monitoring**: Real-time GPU architecture detection
+### Flash Attn V100 Status
+A monitoring node that displays current GPU architecture, installation status of the underlying library, patch state, and detected model type. Connect to any text display node to view in the interface.
 
----
+### Flash Attn V100 Config
+Dynamically adjusts patch behavior without restarting ComfyUI.
+- `force_fp16`: Converts all attention inputs to FP16 (required for Volta kernel execution)
+- `sanitize_output`: Removes NaN and extreme values from attention outputs
+- `sanitize_min` / `sanitize_max`: Bounds for output clamping
+- `debug_mode`: Enables detailed logging
 
-## ⚠️ Prerequisites
+## Configuration
+The patcher exposes a `PatchConfig` class that can be modified programmatically or via the Config node. Default values are optimized for stability on Volta hardware.
 
-**Important:** This requires compiling FlashAttention from source. Ensure you have:
-- Linux environment (Windows WSL2 supported, native Windows untested)
-- CUDA Toolkit 11.6+ or 12.x (must match your PyTorch CUDA version)
-- 15GB+ free RAM for compilation
-- 20-30 minutes for building
+Environment variables:
+- `FLASHATTN_V100_AUTO_PATCH=1`: Enables automatic patching on ComfyUI startup
+- `COMFYUI_LOG_LEVEL=DEBUG`: Increases logging verbosity
 
-### Check Compatibility
-```bash
-python -c "import torch; print(f'Compute Capability: sm_{torch.cuda.get_device_capability()[0]}{torch.cuda.get_device_capability()[1]}')"
-```
+## Limitations
+- Input and output tensors must have head dimensions divisible by 8 due to Volta WMMA instruction requirements
+- Dropout probability must be set to 0.0. Non-zero dropout is not supported by the Volta kernel
+- ALiBi positional biases and softcap logit scaling are not implemented
+- Multi-Query Attention (MQA) and Grouped-Query Attention (GQA) are not supported. Query and Key tensors must have identical head counts
+- Performance gains are achieved through FP16 tensor core utilization. Models requiring BF16 or FP32 attention will incur conversion overhead
+- The patch operates as a Python-level fallback when native variable-length CUDA kernels are unavailable. Processing is performed sequentially per sequence in batched scenarios
 
-### 🚀 Installation
-Step 1: Install the ComfyUI Node
-```bash
-cd ComfyUI/custom_nodes
-git clone https://github.com/FearL0rd/ComfyUI-Flash-Attention_v100.git
-cd ComfyUI-Flash-Attention_v100
-```
+## Troubleshooting
+- `RuntimeError: q must be fp16`: Ensure `force_fp16` is enabled. The Volta kernel strictly requires half-precision inputs
+- `ValueError: shape is invalid for input of size`: Usually indicates a tensor layout mismatch or non-contiguous memory. Enable debug mode to inspect tensor shapes before the kernel call
+- `No module named 'flash_attn.bert_padding'`: Verify that `flash_attn_v100` is installed correctly. The patch includes a built-in fallback implementation if the module is missing
+- Audio/Video generation produces corrupted output: Enable `sanitize_output` in the Config node. This prevents numerical instability in long-sequence softmax operations
+- Performance degradation: Disable the patch for models that natively support SM_80+ architectures. The patch is designed exclusively for compute capability less than 8.0
 
-Step 2: Install Flash Attention (V100 Fork)
-This is the heavy lifting step - compiling the CUDA kernels:
-```bash
-# Install build dependencies
-pip install packaging ninja
-
-# Clone and install the V100-compatible fork
-git clone https://github.com/ai-bond/flash-attention-v100.git /tmp/flash-attn-v100
-cd /tmp/flash-attn-v100
-
-# Build and install (this takes 20-30 minutes)
-python setup.py install
-
-# Alternative if you have limited RAM (uses 2 parallel jobs instead of 4)
-# MAX_JOBS=2 python setup.py install
-```
-Step 3: Verify Installation
-Restart ComfyUI. You should see in the console:
-```bash
-🔍 [FlashAttnV100] Checking GPU compatibility...
-```
-
-### 🎮 Usage
-Method 1: Node-Based Control (Recommended)
-
-Right-click → Add Node → attention → "⚡ Flash Attn V100 Controller"
-
-<img width="919" height="291" alt="image" src="https://github.com/user-attachments/assets/4ad73007-8d5e-427f-88e0-e2a3bea614b1" />
-
-
-Connect your MODEL output → Controller → Rest of workflow
-
-Toggle enable_v100_opt to True/False as needed
-
-Use "ℹ️ Flash Attn V100 Status" node to verify active state
-
-Workflow Example:
-```bash
-[Load Checkpoint] → [FlashAttnV100Controller] → [KSampler] → [Save Image]
-                       ↓
-                 Status String (shows: "ACTIVE sm_70")
-```
-
-### 🧪 Technical Details
-This node monkey-patches comfy.ldm.modules.attention.optimized_attention with a wrapper that:
-
-Reshapes tensors from ComfyUI format (batch*heads, seq, dim) → Flash format (batch, heads, seq, dim)
-Calls flash_attn_func with causal=False (diffusion models aren't autoregressive)
-Reshapes back or falls back to sdpa/vanilla attention on CUDA OOM
-The patch is non-destructive - calling restore() returns ComfyUI to original behavior.
-
-### 🤝 Credits
-Dao-AILab/flash-attention - Original FlashAttention implementation
-ai-bond/flash-attention-v100 - V100/T4 compatibility maintenance
-ComfyUI - The node-based UI framework
-### 📄 License
-MIT License 
-
-Disclaimer: This modifies core attention mechanisms at runtime. While tested on V100/T4, use at your own risk with critical workflows.
+## License
+BSD-3-Clause
